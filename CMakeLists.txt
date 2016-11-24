@@ -51,13 +51,11 @@ add_library(alias SHARED
 	alias/alias_util.c
 )
 
-install(TARGETS alias DESTINATION ${CMAKE_INSTALL_LIBDIR}/darling)
-add_darling_executable(arp arp.tproj/arp.c)
-set_target_properties(arp PROPERTIES COMPILE_FLAGS "-include net/route.h -include sys/socket.h")
+#install(TARGETS alias DESTINATION ${CMAKE_INSTALL_LIBDIR}/darling)
+#add_darling_executable(arp arp.tproj/arp.c)
+#set_target_properties(arp PROPERTIES COMPILE_FLAGS "-include net/route.h -include sys/socket.h")
+#install(TARGETS arp DESTINATION libexec/darling/usr/bin)
 
-
-
-install(TARGETS arp DESTINATION libexec/darling/usr/bin)
 # Manpages
 install(FILES
 	cfilutil/cfilutil.1
