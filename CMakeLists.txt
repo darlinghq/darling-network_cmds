@@ -18,9 +18,7 @@ add_definitions(
 	-D__APPLE_USE_RFC_3542=1
 	-D__APPLE_API_OBSOLETE=1
 	-DPRIVATE
-	-D_DARWIN_C_SOURCE
 	-DKERNEL_PRIVATE
-	-D__APPLE__
 )
 
 # Hide warnings
