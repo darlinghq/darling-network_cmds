@@ -10,7 +10,9 @@ include(darling_exe)
 include_directories(
 	${DARLING_TOP_DIRECTORY}/src/libc/include/FreeBSD
 	${DARLING_TOP_DIRECTORY}/platform-include
-	${DARLING_TOP_DIRECTORY}/kernel-include
+	${DARLING_TOP_DIRECTORY}/kernel-include/bsd
+	${DARLING_TOP_DIRECTORY}/kernel-include/libkern
+	${DARLING_TOP_DIRECTORY}/kernel-include/osfmk
 )
 
 add_definitions(
