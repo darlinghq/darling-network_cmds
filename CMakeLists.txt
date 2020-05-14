@@ -7,14 +7,6 @@ cmake_policy(SET CMP0005 NEW)
 
 include(darling_exe)
 
-include_directories(
-	${DARLING_TOP_DIRECTORY}/src/libc/include/FreeBSD
-	${DARLING_TOP_DIRECTORY}/platform-include
-	${DARLING_TOP_DIRECTORY}/kernel-include/bsd
-	${DARLING_TOP_DIRECTORY}/kernel-include/libkern
-	${DARLING_TOP_DIRECTORY}/kernel-include/osfmk
-)
-
 add_definitions(
 	-DUSE_RFC2292BIS=1
 	-D__APPLE_USE_RFC_3542=1
