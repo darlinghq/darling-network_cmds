@@ -56,7 +56,7 @@
 
 pcap_t *pc;		/* pcap device */
 int datalinkOffset;	/* offset of ip packet from datalink packet */
-int captureDebug = 0;
+int captureDebug = 1;
 unsigned int thisTimeZone;
 
 void CaptureInit(u_int32_t sourceIP, u_int16_t sourcePort,
@@ -131,8 +131,8 @@ void CaptureInit(u_int32_t sourceIP, u_int16_t sourcePort,
     exit(-1);
   }
 
-  strncpy(source, InetAddress(sourceIP), sizeof(source) - 1);
-  strncpy(target, InetAddress(targetIP), sizeof(target) - 1);
+  strlcpy(source, InetAddress(sourceIP), sizeof(source));
+  strlcpy(target, InetAddress(targetIP), sizeof(target));
 
   /* Setup initial filter */
   sprintf(filtercmds,

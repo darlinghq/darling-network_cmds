@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008-2014 Apple Inc. All rights reserved.
+ * Copyright (c) 2008-2016 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -354,11 +354,7 @@ protopr(uint32_t proto,		/* for sysctl version we pass proto # */
 					   "Current listen queue sizes (qlen/incqlen/maxqlen)");
 			putchar('\n');
 			if (Aflag) {
-#if !TARGET_OS_EMBEDDED
 				printf("%-16.16s ", "Socket");
-#else
-				printf("%-8.8s ", "Socket");
-#endif
 				printf("%-9.9s", "Flowhash");
 			}
 			if (Lflag)
@@ -376,26 +372,17 @@ protopr(uint32_t proto,		/* for sysctl version we pass proto # */
 				if (prioflag >= 0)
 					printf(" %7.7s[%1d] %7.7s[%1d]", "rxbytes", prioflag, "txbytes", prioflag);
 				if (vflag > 0)
-					printf(" %6.6s %6.6s %6.6s %6.6s",
-					    "rhiwat", "shiwat", "pid", "epid");
+					printf(" %6.6s %6.6s %6.6s %6.6s %6s %10s",
+					       "rhiwat", "shiwat", "pid", "epid", "state", "options");
 				printf("\n");
 			}
 			first = 0;
 		}
 		if (Aflag) {
 			if (istcp)
-#if !TARGET_OS_EMBEDDED
 				printf("%16lx ", (u_long)inp->inp_ppcb);
-#else
-			printf("%8lx ", (u_long)inp->inp_ppcb);
-			
-#endif
 			else
-#if !TARGET_OS_EMBEDDED
 				printf("%16lx ", (u_long)so->so_pcb);
-#else
-			printf("%8lx ", (u_long)so->so_pcb);
-#endif
 			printf("%8x ", inp->inp_flowhash);
 		}
 		if (Lflag) {
@@ -482,11 +469,6 @@ protopr(uint32_t proto,		/* for sysctl version we pass proto # */
 				printf("%-11d", tp->t_state);
 			else {
 				printf("%-11s", tcpstates[tp->t_state]);
-#if defined(TF_NEEDSYN) && defined(TF_NEEDFIN)
-				/* Show T/TCP `hidden state' */
-				if (tp->t_flags & (TF_NEEDSYN|TF_NEEDFIN))
-					putchar('*');
-#endif /* defined(TF_NEEDSYN) && defined(TF_NEEDFIN) */
 			}
 		}
 		if (!istcp)
@@ -509,11 +491,13 @@ protopr(uint32_t proto,		/* for sysctl version we pass proto # */
 				   prioflag < SO_TC_STATS_MAX ? so_stat->xst_tc_stats[prioflag].txbytes : 0);
 		}
 		if (vflag > 0) {
-			printf(" %6u %6u %6u %6u",
+			printf(" %6u %6u %6u %6u 0x%04x 0x%08x",
 			       so_rcv->sb_hiwat,
 			       so_snd->sb_hiwat,
 			       so->so_last_pid,
-			       so->so_e_pid);
+			       so->so_e_pid,
+			       so->so_state,
+			       so->so_options);
 		}
 		putchar('\n');
 	}
@@ -585,6 +569,8 @@ tcp_stats(uint32_t off , char *name, int af)
 	p(tcps_sndwinup, "\t\t%u window update packet%s\n");
 	p(tcps_sndctrl, "\t\t%u control packet%s\n");
 	p(tcps_fcholdpacket, "\t\t%u data packet%s sent after flow control\n");
+	p(tcps_synchallenge, "\t\t%u challenge ACK%s sent due to unexpected SYN\n");
+	p(tcps_rstchallenge, "\t\t%u challenge ACK%s sent due to unexpected RST\n");
 	t_swcsum = tcpstat.tcps_snd_swcsum + tcpstat.tcps_snd6_swcsum;
 	if ((t_swcsum - pt_swcsum) || sflag <= 1)
         printf("\t\t%u checksummed in software\n", (t_swcsum - pt_swcsum));
@@ -612,6 +598,7 @@ tcp_stats(uint32_t off , char *name, int af)
 		"\t\t%u packet%s (%u byte%s) of data after window\n");
 	p(tcps_rcvwinprobe, "\t\t%u window probe%s\n");
 	p(tcps_rcvwinupd, "\t\t%u window update packet%s\n");
+	p(tcps_recovered_pkts, "\t\t%u packet%s recovered after loss\n");
 	p(tcps_rcvafterclose, "\t\t%u packet%s received after close\n");
 	p(tcps_badrst, "\t\t%u bad reset%s\n");
 	p(tcps_rcvbadsum, "\t\t%u discarded for bad checksum%s\n");
@@ -639,17 +626,24 @@ tcp_stats(uint32_t off , char *name, int af)
 	  "\t\t%u connection%s updated cached RTT variance on close\n");
 	p(tcps_cachedssthresh,
 	  "\t\t%u connection%s updated cached ssthresh on close\n");
+	p(tcps_usedrtt, "\t\t%u connection%s initialized RTT from route cache\n");
+	p(tcps_usedrttvar,
+	  "\t\t%u connection%s initialized RTT variance from route cache\n");
+	p(tcps_usedssthresh,
+	  "\t\t%u connection%s initialized ssthresh from route cache\n");
 	p(tcps_conndrops, "\t%u embryonic connection%s dropped\n");
 	p2(tcps_rttupdated, tcps_segstimed,
 		"\t%u segment%s updated rtt (of %u attempt%s)\n");
 	p(tcps_rexmttimeo, "\t%u retransmit timeout%s\n");
 	p(tcps_timeoutdrop, "\t\t%u connection%s dropped by rexmit timeout\n");
 	p(tcps_rxtfindrop, "\t\t%u connection%s dropped after retransmitting FIN\n");
+	p(tcps_sndrexmitbad, "\t\t%u unnecessary packet retransmissions%s\n");
 	p(tcps_persisttimeo, "\t%u persist timeout%s\n");
 	p(tcps_persistdrop, "\t\t%u connection%s dropped by persist timeout\n");
 	p(tcps_keeptimeo, "\t%u keepalive timeout%s\n");
 	p(tcps_keepprobe, "\t\t%u keepalive probe%s sent\n");
 	p(tcps_keepdrops, "\t\t%u connection%s dropped by keepalive\n");
+	p(tcps_ka_offload_drops, "\t\t%u connection%s dropped by keepalive offload\n");
 	p(tcps_predack, "\t%u correct ACK header prediction%s\n");
 	p(tcps_preddat, "\t%u correct data packet header prediction%s\n");
 #ifdef TCP_MAX_SACK
@@ -697,11 +691,19 @@ tcp_stats(uint32_t off , char *name, int af)
 	p(tcps_ecn_conn_plnoce, "\t\t%u connection%s using ECN have seen packet loss but no CE\n");
 	p(tcps_ecn_conn_pl_ce, "\t\t%u connection%s using ECN have seen packet loss and CE\n");
 	p(tcps_ecn_conn_nopl_ce, "\t\t%u connection%s using ECN received CE but no packet loss\n");
+	p(tcps_ecn_fallback_synloss, "\t\t%u connection%s fell back to non-ECN due to SYN-loss\n");
+	p(tcps_ecn_fallback_reorder, "\t\t%u connection%s fell back to non-ECN due to reordering\n");
+	p(tcps_ecn_fallback_ce, "\t\t%u connection%s fell back to non-ECN due to excessive CE-markings\n");
+	p(tcps_ecn_fallback_droprst, "\t\t%u connection%s fell back caused by connection drop due to RST\n");
+	p(tcps_ecn_fallback_droprxmt, "\t\t%u connection%s fell back due to drop after multiple retransmits \n");
+	p(tcps_ecn_fallback_synrst, "\t\t%u connection%s fell back due to RST after SYN\n");
+
 	p(tcps_detect_reordering, "\t%u time%s packet reordering was detected on a connection\n");
 	p(tcps_reordered_pkts, "\t\t%u time%s transmitted packets were reordered\n");
 	p(tcps_delay_recovery, "\t\t%u time%s fast recovery was delayed to handle reordering\n");
 	p(tcps_avoid_rxmt, "\t\t%u time%s retransmission was avoided by delaying recovery\n");
 	p(tcps_unnecessary_rxmt, "\t\t%u retransmission%s not needed \n");
+	p(tcps_tailloss_rto, "\t%u retransmission%s due to tail loss\n");
 	p(tcps_dsack_sent, "\t%u time%s DSACK option was sent\n");
 	p(tcps_dsack_recvd, "\t\t%u time%s DSACK option was received\n");
 	p(tcps_dsack_disable, "\t\t%u time%s DSACK was disabled on a connection\n");
@@ -710,6 +712,7 @@ tcp_stats(uint32_t off , char *name, int af)
 	p(tcps_dsack_recvd_old,"\t\t%u time%s ignored old DSACK options\n");
 	p(tcps_pmtudbh_reverted, "\t%u time%s PMTU Blackhole detection, size reverted\n");
 	p(tcps_drop_after_sleep, "\t%u connection%s were dropped after long sleep\n");
+	p(tcps_nostretchack, "\t%u connection%s had stretch ack algorithm disabled\n");
 
 	p(tcps_tfo_cookie_sent,"\t%u time%s a TFO-cookie has been announced\n");
 	p(tcps_tfo_syn_data_rcv,"\t%u SYN%s with data and a valid TFO-cookie have been received\n");
@@ -721,6 +724,24 @@ tcp_stats(uint32_t off , char *name, int af)
 	p(tcps_tfo_syn_data_acked,"\t\t%u time%s our SYN with data has been acknowledged\n");
 	p(tcps_tfo_syn_loss,"\t%u time%s a connection-attempt with TFO fell back to regular TCP\n");
 	p(tcps_tfo_blackhole,"\t%u time%s a TFO-connection blackhole'd\n");
+	p(tcps_tfo_cookie_wrong,"\t%u time%s a TFO-cookie we sent was wrong\n");
+	p(tcps_tfo_no_cookie_rcv,"\t%u time%s did not received a TFO-cookie we asked for\n");
+	p(tcps_tfo_heuristics_disable,"\t%u time%s TFO got disabled due to heuristicsn\n");
+	p(tcps_tfo_sndblackhole,"\t%u time%s TFO got blackholed in the sending direction\n");
+
+	p(tcps_mss_to_default,"\t%u time%s maximum segment size was changed to default\n");
+	p(tcps_mss_to_medium,"\t%u time%s maximum segment size was changed to medium\n");
+	p(tcps_mss_to_low,"\t%u time%s maximum segment size was changed to low\n");
+
+	p(tcps_timer_drift_le_1_ms,"\t%u timer drift%s less or equal to 1 ms\n");
+	p(tcps_timer_drift_le_10_ms,"\t%u timer drift%s less or equal to 10 ms\n");
+	p(tcps_timer_drift_le_20_ms,"\t%u timer drift%s less or equal to 20 ms\n");
+	p(tcps_timer_drift_le_50_ms,"\t%u timer drift%s less or equal to 50 ms\n");
+	p(tcps_timer_drift_le_100_ms,"\t%u timer drift%s less or equal to 100 ms\n");
+	p(tcps_timer_drift_le_200_ms,"\t%u timer drift%s less or equal to 200 ms\n");
+	p(tcps_timer_drift_le_500_ms,"\t%u timer drift%s less or equal to 500 ms\n");
+	p(tcps_timer_drift_le_1000_ms,"\t%u timer drift%s less or equal to 1000 ms\n");
+	p(tcps_timer_drift_gt_1000_ms,"\t%u timer drift%s greater than to 1000 ms\n");
 
 	if (interval > 0) {
 		bcopy(&tcpstat, &ptcpstat, len);
@@ -791,10 +812,10 @@ mptcp_stats(uint32_t off , char *name, int af)
 	p(tcps_mp_badcsum, "\t%u bad DSS checksum%s\n");
 	p(tcps_mp_oodata, "\t%u time%s received out of order data \n");
 	p3(tcps_mp_switches, "\t%u subflow switch%s\n");
-	p3(tcps_mp_sel_symtomsd, "\t%u subflow switche%s due to advisory\n");
-	p3(tcps_mp_sel_rtt, "\t%u subflow switche%s due to rtt\n");
-	p3(tcps_mp_sel_rto, "\t%u subflow switche%s due to rto\n");
-	p3(tcps_mp_sel_peer, "\t%u subflow switche%s due to peer\n");
+	p3(tcps_mp_sel_symtomsd, "\t%u subflow switch%s due to advisory\n");
+	p3(tcps_mp_sel_rtt, "\t%u subflow switch%s due to rtt\n");
+	p3(tcps_mp_sel_rto, "\t%u subflow switch%s due to rto\n");
+	p3(tcps_mp_sel_peer, "\t%u subflow switch%s due to peer\n");
 	p3(tcps_mp_num_probes, "\t%u number of subflow probe%s\n");
 
 	if (interval > 0) {
@@ -921,12 +942,12 @@ ip_stats(uint32_t off , char *name, int af )
 
 	if (sysctlbyname("net.inet.ip.output_perf_data", &out_net_perf, &out_net_perf_len, 0, 0) < 0) {
 		warn("sysctl: net.inet.ip.output_perf_data");
-		return;
+		bzero(&out_net_perf, out_net_perf_len);
 	}
 
 	if (sysctlbyname("net.inet.ip.input_perf_data", &in_net_perf, &in_net_perf_len, 0, 0) < 0) {
 		warn("sysctl: net.inet.ip.input_perf_data");
-		return;
+		bzero(&in_net_perf, in_net_perf_len);
 	}
 
 	if (interval && vflag > 0)
@@ -1015,6 +1036,7 @@ ip_stats(uint32_t off , char *name, int af )
 	p(ips_badaddr, "\t\t%u datagram%s with bad address in header\n");
 	p(ips_pktdropcntrl,
 	    "\t\t%u packet%s dropped due to no bufs for control data\n");
+	p(ips_necp_policy_drop, "\t\t%u packet%s dropped due to NECP policy\n");
 	p2(ips_snd_swcsum, ips_snd_swcsum_bytes,
 	    "\t\t%u header%s (%u byte%s) checksummed in software\n");
 
@@ -1079,8 +1101,11 @@ arp_stats(uint32_t off, char *name, int af)
     printf(m, ARPDIFF(f), plural(ARPDIFF(f)))
 #define	p2(f, m) if (ARPDIFF(f) || sflag <= 1) \
     printf(m, ARPDIFF(f), pluralies(ARPDIFF(f)))
+#define	p3(f, m) if (ARPDIFF(f) || sflag <= 1) \
+    printf(m, ARPDIFF(f), plural(ARPDIFF(f)), pluralies(ARPDIFF(f)))
 
-	p(txrequests, "\t%u ARP request%s sent\n");
+	p(txrequests, "\t%u broadast ARP request%s sent\n");
+	p(txurequests, "\t%u unicast ARP request%s sent\n");
 	p2(txreplies, "\t%u ARP repl%s sent\n");
 	p(txannounces, "\t%u ARP announcement%s sent\n");
 	p(rxrequests, "\t%u ARP request%s received\n");
@@ -1089,6 +1114,7 @@ arp_stats(uint32_t off, char *name, int af)
 	p(txconflicts, "\t%u ARP conflict probe%s sent\n");
 	p(invalidreqs, "\t%u invalid ARP resolve request%s\n");
 	p(reqnobufs, "\t%u total packet%s dropped due to lack of memory\n");
+	p3(held, "\t%u total packet%s held awaiting ARP repl%s\n");
 	p(dropped, "\t%u total packet%s dropped due to no ARP entry\n");
 	p(purged, "\t%u total packet%s dropped during ARP entry removal\n");
 	p2(timeouts, "\t%u ARP entr%s timed out\n");
@@ -1327,8 +1353,7 @@ inetname(struct in_addr *inp)
 	if (inp->s_addr == INADDR_ANY)
 		strlcpy(line, "*", sizeof(line));
 	else if (cp) {
-		strncpy(line, cp, sizeof(line) - 1);
-		line[sizeof(line) - 1] = '\0';
+		strlcpy(line, cp, sizeof(line));
 	} else {
 		inp->s_addr = ntohl(inp->s_addr);
 #define C(x)	((u_int)((x) & 0xff))

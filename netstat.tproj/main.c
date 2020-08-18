@@ -166,6 +166,10 @@ struct protox ipcprotox[] = {
 	{ NULL,		NULL,		NULL,	NULL,	0 }
 };
 
+struct protox kernprotox[] = {
+	{ NULL,		print_net_api_stats,	NULL,	"net_api", 0 },
+	{ NULL,		NULL,		NULL,	NULL,	0 }
+};
 
 struct protox *protoprotox[] = {
 	protox,
@@ -178,6 +182,7 @@ struct protox *protoprotox[] = {
 	systmprotox,
 	nstatprotox,
 	ipcprotox,
+	kernprotox,
 	NULL
 };
 
@@ -199,7 +204,7 @@ int	Fflag;		/* show i/f forwarded packets */
 int	gflag;		/* show group (multicast) routing or stats */
 #endif
 int	iflag;		/* show interfaces */
-int	lflag;		/* show routing table with use and ref */
+int	lflag;		/* show routing table with more information */
 int	Lflag;		/* show size of listen queues */
 int	mflag;		/* show memory stats */
 int	nflag;		/* show addresses numerically */
@@ -215,6 +220,7 @@ int	Wflag;		/* wide display */
 int	qflag;		/* classq stats display */
 int	Qflag;		/* opportunistic polling stats display */
 int	xflag;		/* show extended link-layer reachability information */
+int	zflag;		/* show only entries with non zero rtt metrics */
 
 int	cq = -1;	/* send classq index (-1 for all) */
 int	interval;	/* repeat interval for i/f stats */
@@ -234,7 +240,7 @@ main(argc, argv)
 
 	af = AF_UNSPEC;
 
-	while ((ch = getopt(argc, argv, "Aabc:dFf:gI:ikLlmnP:p:qQrRsStuvWw:x")) != -1)
+	while ((ch = getopt(argc, argv, "Aabc:dFf:gI:ikLlmnP:p:qQrRsStuvWw:xz")) != -1)
 		switch(ch) {
 		case 'A':
 			Aflag = 1;
@@ -294,7 +300,7 @@ main(argc, argv)
 			iflag = 1;
 			break;
 		case 'l':
-			lflag = 1;
+			lflag += 1;
 			break;
 		case 'L':
 			Lflag = 1;
@@ -353,6 +359,9 @@ main(argc, argv)
 		case 'x':
 			xflag = 1;
 			Rflag = 1;
+			break;
+		case 'z':
+			zflag = 1;
 			break;
 		case '?':
 		default:
@@ -453,6 +462,11 @@ main(argc, argv)
 	if (af == AF_UNSPEC && !Lflag)
 		for (tp = ipcprotox; tp->pr_name; tp++)
 			printproto(tp, tp->pr_name);
+
+	if (af == AF_UNSPEC && !Lflag)
+		for (tp = kernprotox; tp->pr_name; tp++)
+			printproto(tp, tp->pr_name);
+
 
 #ifdef SRVCACHE
 	_serv_cache_close();

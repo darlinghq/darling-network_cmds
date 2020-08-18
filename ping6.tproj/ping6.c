@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2002-2016 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -143,14 +143,13 @@ __unused static const char copyright[] =
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#ifdef HAVE_POLL_H
-#include <poll.h>
-#endif
 #include <sysexits.h>
+#include <getopt.h>
 
 #ifdef IPSEC
 #include <netinet6/ah.h>
@@ -176,6 +175,8 @@ struct tv32 {
 #define	DEFDATALEN	ICMP6ECHOTMLEN
 #define MAXDATALEN	MAXPACKETLEN - IP6LEN - ICMP6ECHOLEN
 #define	NROUTES		9		/* number of record route slots */
+#define	MAXWAIT		10000		/* max ms to wait for response */
+#define	MAXALARM	(60 * 60)	/* max seconds for alarm timeout */
 
 #define	A(bit)		rcvd_tbl[(bit)>>3]	/* identify byte in array */
 #define	B(bit)		(1 << ((bit) & 0x07))	/* identify bit in byte */
@@ -189,6 +190,7 @@ struct tv32 {
 #define	F_QUIET		0x0010
 #define	F_RROUTE	0x0020
 #define	F_SO_DEBUG	0x0040
+#define	F_PRTIME	0x0080
 #define	F_VERBOSE	0x0100
 #ifdef IPSEC
 #ifdef IPSEC_POLICY_IPSEC
@@ -211,8 +213,22 @@ struct tv32 {
 #define F_AUDIBLE	0x400000
 #define F_MISSED	0x800000
 #define F_DONTFRAG	0x1000000
+#define	F_SWEEP		0x2000000
+#define F_CONNECT	0x4000000
 #define F_NOUSERDATA	(F_NODEADDR | F_FQDN | F_FQDNOLD | F_SUPTYPES)
+#define	F_WAITTIME	0x8000000
 u_int options;
+
+static int longopt_flag = 0;
+
+#define	LOF_CONNECT	0x01
+#define LOF_PRTIME	0x02
+
+static const struct option longopts[] = {
+	{ "apple-connect", no_argument, &longopt_flag, LOF_CONNECT },
+	{ "apple-time", no_argument, &longopt_flag, LOF_PRTIME },
+	{ NULL, 0, NULL, 0 }
+};
 
 #define IN6LEN		sizeof(struct in6_addr)
 #define SA6LEN		sizeof(struct sockaddr_in6)
@@ -250,12 +266,6 @@ struct cmsghdr *cm = NULL;
 char *boundif;
 unsigned int ifscope;
 int nocell;
-#ifdef HAVE_POLL_H
-struct pollfd fdmaskp[1];
-#else
-fd_set *fdmaskp = NULL;
-int fdmasks;
-#endif
 
 /* counters */
 long nmissedmax;		/* max value of ntransmitted - nreceived - 1 */
@@ -263,7 +273,15 @@ long npackets;			/* max packets to transmit */
 long nreceived;			/* # of packets we got back */
 long nrepeats;			/* number of duplicates */
 long ntransmitted;		/* sequence # for outbound packets = #sent */
-struct timeval interval = {1, 0}; /* interval between packets */
+static int interval = 1000;	/* interval between packets in ms */
+static int waittime = MAXWAIT;	/* timeout for each packet */
+static long nrcvtimeout = 0;	/* # of packets we got back after waittime */
+
+long snpackets = 0;		/* max packets to transmit in one sweep */
+long sntransmitted = 0;		/* # of packets we sent in this sweep */
+int sweepmax = 0;		/* max value of payload in sweep */
+int sweepmin = 0;		/* start value of payload in sweep */
+int sweepincr = 1;		/* payload increment in sweep */
 
 /* timing */
 int timing;			/* flag to do timing */
@@ -277,7 +295,7 @@ u_short naflags;
 
 /* for ancillary data(advanced API) */
 struct msghdr smsghdr;
-struct iovec smsgiov;
+struct iovec smsgiov[2];
 char *scmsg = NULL;
 
 volatile sig_atomic_t seenalrm;
@@ -288,8 +306,14 @@ volatile sig_atomic_t seeninfo;
 
 int rcvtclass = 0;
 
-int how_so_traffic_class = 0;
+int use_sendmsg = 0;
+int use_recvmsg = 0;
 int so_traffic_class = SO_TC_CTL;	/* use control class, by default */
+int net_service_type = -1;
+
+int32_t thiszone;		/* seconds offset from gmt to local time */
+extern int32_t gmt2local(time_t);
+static void pr_currenttime(void);
 
 int	 main(int, char *[]);
 void	 fill(char *, char *);
@@ -299,7 +323,6 @@ int	 get_tclass(struct msghdr *);
 int	 get_so_traffic_class(struct msghdr *);
 struct in6_pktinfo *get_rcvpktinfo(struct msghdr *);
 void	 onsignal(int);
-void	 retransmit(void);
 void	 onint(int);
 size_t	 pingerlen(void);
 int	 pinger(void);
@@ -321,26 +344,21 @@ void	 pr_retip(struct ip6_hdr *, u_char *);
 void	 summary(void);
 void	 tvsub(struct timeval *, struct timeval *);
 int	 setpolicy(int, char *);
-char	*nigroup(char *);
-static uint32_t str2svc(const char *);
+char	*nigroup(char *, int);
+static int str2sotc(const char *, bool *);
+static int str2netservicetype(const char *, bool *);
+static u_int8_t str2tclass(const char *, bool *);
 void	 usage(void);
 
 int
 main(int argc, char *argv[])
 {
-	struct itimerval itimer;
+	struct timeval last, intvl;
 	struct sockaddr_in6 from;
-#ifndef HAVE_ARC4RANDOM
-	struct timeval seed;
-#endif
-#ifdef HAVE_POLL_H
-	int timeout;
-#else
-	struct timeval timeout, *tv;
-#endif
 	struct addrinfo hints;
 	int cc, i;
-	int ch, hold, packlen, preload, optval, ret_ga;
+	int almost_done, ch, hold, packlen, preload, optval, ret_ga;
+	int nig_oldmcprefix = -1;
 	u_char *datap;
 	char *e, *target, *ifname = NULL, *gateway = NULL;
 	int ip6optlen = 0;
@@ -358,13 +376,15 @@ main(int argc, char *argv[])
 	char *policy_in = NULL;
 	char *policy_out = NULL;
 #endif
-	double intval;
+	double t;
+	u_long alarmtimeout;
 	size_t rthlen;
 #ifdef IPV6_USE_MIN_MTU
 	int mflag = 0;
 #endif
 	/* T_CLASS value -1 means default, so -2 means do not bother */
 	int tclass = -2;
+	bool valid;
 
 	/* just to be sure */
 	memset(&smsghdr, 0, sizeof(smsghdr));
@@ -381,8 +401,9 @@ main(int argc, char *argv[])
 #define ADDOPTS	"AE"
 #endif /*IPSEC_POLICY_IPSEC*/
 #endif
-	while ((ch = getopt(argc, argv,
-	    "a:b:B:Cc:DdfHg:h:I:i:k:l:mnNop:qrRS:s:tvwWz:" ADDOPTS)) != -1) {
+	while ((ch = getopt_long(argc, argv,
+	    "a:b:B:Cc:DdfHG:g:h:I:i:k:K:l:mnNop:qrRS:s:tvwWz:" ADDOPTS,
+	    longopts, NULL)) != -1) {
 #undef ADDOPTS
 		switch (ch) {
 		case 'a':
@@ -471,6 +492,66 @@ main(int argc, char *argv[])
 		case 'g':
 			gateway = optarg;
 			break;
+		case 'G': {
+			char *ptr ;
+			char *tofree;
+			unsigned long ultmp;
+
+			tofree = strdup(optarg);
+			if (tofree == NULL)
+				errx(1, "### strdup() failed");
+			ptr = tofree;
+			do {
+				char *str;
+				char *ep;
+				
+				if ((str = strsep(&ptr, ",")) == NULL)
+					errx(1, "-G requires maximum packet size");
+				ultmp = strtoul(str, &ep, 0);
+				if (*ep || ep == optarg)
+					errx(EX_USAGE, "option -G invalid maximum packet size: `%s'",
+					     str);
+				options |= F_SWEEP;
+				sweepmax = ultmp;
+				if (sweepmax < 1 || sweepmax > MAXDATALEN) {
+					errx(1,
+					     "-G invalid maximum packet size, needs to be between 1 and %d",
+					     MAXDATALEN);
+				}
+
+				if ((str = strsep(&ptr, ",")) == NULL)
+					break;
+				if (*str != 0) {
+					ultmp = strtoul(str, &ep, 0);
+					if (*ep || ep == optarg)
+						errx(EX_USAGE, "option -G invalid minimum packet size: `%s'",
+						     str);
+					sweepmin = ultmp;
+					if (sweepmin < 0 || sweepmin > MAXDATALEN) {
+						errx(1,
+						     "-G invalid minimum packet size, needs to be between 0 and %d",
+						     MAXDATALEN);
+					}
+				}
+				
+				if ((str = strsep(&ptr, ",")) == NULL)
+					break;
+				if (*str == 0)
+					break;
+				ultmp = strtoul(str, &ep, 0);
+				if (*ep || ep == optarg)
+					errx(EX_USAGE, "option -G invalid sweep increment size: `%s'",
+					     str);
+				sweepincr = ultmp;
+				if (sweepincr < 1 || sweepincr > MAXDATALEN) {
+					errx(1,
+					     "-G invalid sweep increment size, needs to be between 1 and %d",
+					     MAXDATALEN);
+				}
+			} while (0);
+			free(tofree);
+			break;
+		}
 		case 'H':
 			options |= F_HOSTNAME;
 			break;
@@ -490,33 +571,51 @@ main(int argc, char *argv[])
 #endif
 			break;
 		case 'i':		/* wait between sending packets */
-			intval = strtod(optarg, &e);
+			t = strtod(optarg, &e);
 			if (*optarg == '\0' || *e != '\0')
 				errx(1, "illegal timing interval %s", optarg);
-			if (intval < 0.1 && getuid()) {
-				errx(1, "%s: only root may use interval < 0.1s",
+			if (t < 0.1 && getuid()) {
+				errx(1, "%s: only root may use interval < 1s",
 				    strerror(EPERM));
 			}
-			interval.tv_sec = (long)intval;
-			interval.tv_usec =
-			    (long)((intval - interval.tv_sec) * 1000000);
-			if (interval.tv_sec < 0)
+			intvl.tv_sec = (long)t;
+			intvl.tv_usec =
+			    (long)((t - intvl.tv_sec) * 1000000);
+			if (intvl.tv_sec < 0)
 				errx(1, "illegal timing interval %s", optarg);
 			/* less than 1/hz does not make sense */
-			if (interval.tv_sec == 0 && interval.tv_usec < 1) {
+			if (intvl.tv_sec == 0 && intvl.tv_usec < 1) {
 				warnx("too small interval, raised to .000001");
-				interval.tv_usec = 1;
+				intvl.tv_usec = 1;
 			}
 			options |= F_INTERVAL;
 			break;
 		case 'k':
-			how_so_traffic_class++;
-			so_traffic_class = str2svc(optarg);
-			if (so_traffic_class == UINT32_MAX)
+			if (strcasecmp(optarg, "sendmsg") == 0) {
+				use_sendmsg++;
+				break;
+			}
+			if (strcasecmp(optarg, "recvmsg") == 0) {
+				use_recvmsg++;
+				break;
+			}
+			so_traffic_class = str2sotc(optarg, &valid);
+			if (valid == false)
 				errx(EX_USAGE, "bad traffic class: `%s'",
 				     optarg);
 			break;
-
+		case 'K':
+			if (strcasecmp(optarg, "sendmsg") == 0) {
+				use_sendmsg++;
+				break;
+			}
+			net_service_type = str2netservicetype(optarg, &valid);
+			if (valid == false)
+				errx(EX_USAGE, "bad network service type: `%s'",
+				     optarg);
+			/* suppress default traffic class (-k can still be specified after -K) */
+			so_traffic_class = -1;
+			break;
 		case 'l':
 			if (getuid()) {
 				errno = EPERM;
@@ -539,6 +638,7 @@ main(int argc, char *argv[])
 			break;
 		case 'N':
 			options |= F_NIGROUP;
+			nig_oldmcprefix++;
 			break;
 		case 'o':
 			options |= F_ONCE;
@@ -546,7 +646,7 @@ main(int argc, char *argv[])
 		case 'p':		/* fill buffer with user pattern */
 			options |= F_PINGFILLED;
 			fill((char *)datap, optarg);
-				break;
+			break;
 		case 'q':
 			options |= F_QUIET;
 			break;
@@ -604,14 +704,20 @@ main(int argc, char *argv[])
 			options |= F_FQDNOLD;
 			break;
 		case 'z':
-			tclass = (int)strtol(optarg, &e, 10);
-			if (tclass < -1 || *optarg == '\0' || *e != '\0')
+			tclass = str2tclass(optarg, &valid);
+			if (valid == false)
 				errx(1, "illegal TOS value -- %s", optarg);
-			if (tclass > MAXTOS)
-				errx(1,
-				    "TOS value too large, maximum is %d",
-				    MAXTOS);
 			rcvtclass = 1;
+			break;
+		case 'X':
+			alarmtimeout = strtoul(optarg, &e, 0);
+			if (alarmtimeout < 1 || alarmtimeout == ULONG_MAX)
+				errx(EX_USAGE, "invalid timeout: `%s'",
+				    optarg);
+			if (alarmtimeout > MAXALARM)
+				errx(EX_USAGE, "invalid timeout: `%s' > %d",
+				    optarg, MAXALARM);
+			alarm((int)alarmtimeout);
 			break;
 #ifdef IPSEC
 #ifdef IPSEC_POLICY_IPSEC
@@ -635,6 +741,20 @@ main(int argc, char *argv[])
 			break;
 #endif /*IPSEC_POLICY_IPSEC*/
 #endif /*IPSEC*/
+		case 0:
+			switch (longopt_flag) {
+				case LOF_CONNECT:
+					options |= F_CONNECT;
+					break;
+				case LOF_PRTIME:
+					options |= F_PRTIME;
+					thiszone = gmt2local(0);
+					break;
+				default:
+					break;
+			}
+			longopt_flag = 0;
+			break;
 		default:
 			usage();
 			/*NOTREACHED*/
@@ -644,6 +764,12 @@ main(int argc, char *argv[])
 	if (boundif != NULL && (ifscope = if_nametoindex(boundif)) == 0)
 		errx(1, "bad interface name");
 
+	if ((options & F_SWEEP) && !sweepmax)
+		errx(EX_USAGE, "Maximum sweep size must be specified");
+
+	if ((options & F_SWEEP) && (options & F_NOUSERDATA))
+		errx(EX_USAGE, "Option -G incompatible with -t, -w and -W");
+	
 	argc -= optind;
 	argv += optind;
 
@@ -667,7 +793,7 @@ main(int argc, char *argv[])
 	}
 
 	if (options & F_NIGROUP) {
-		target = nigroup(argv[argc - 1]);
+		target = nigroup(argv[argc - 1], nig_oldmcprefix);
 		if (target == NULL) {
 			usage();
 			/*NOTREACHED*/
@@ -686,7 +812,7 @@ main(int argc, char *argv[])
 	if (ret_ga)
 		errx(1, "getaddrinfo -- %s", gai_strerror(ret_ga));
 	if (res->ai_canonname)
-		hostname = res->ai_canonname;
+		hostname = strdup(res->ai_canonname);
 	else
 		hostname = target;
 
@@ -787,6 +913,26 @@ main(int argc, char *argv[])
 	if ((options & F_FLOOD) && (options & F_INTERVAL))
 		errx(1, "-f and -i incompatible options");
 
+	if ((options & F_CONNECT)) {
+		if (connect(s, (struct sockaddr *)&dst, sizeof(dst)) == -1)
+			err(EX_OSERR, "connect");
+	}
+	
+	if (sweepmax) {
+		if (sweepmin >= sweepmax)
+			errx(EX_USAGE, "Maximum packet size must be greater than the minimum packet size");
+		
+		if (datalen != DEFDATALEN)
+			errx(EX_USAGE, "Packet size and ping sweep are mutually exclusive");
+		
+		if (npackets > 0) {
+			snpackets = npackets;
+			npackets = 0;
+		} else
+			snpackets = 1;
+		datalen = sweepmin;
+	}
+	
 	if ((options & F_NOUSERDATA) == 0) {
 		if (datalen >= sizeof(struct tv32)) {
 			/* we can time transfer */
@@ -795,9 +941,9 @@ main(int argc, char *argv[])
 			timing = 0;
 		/* in F_VERBOSE case, we may get non-echoreply packets*/
 		if (options & F_VERBOSE)
-			packlen = 2048 + IP6LEN + ICMP6ECHOLEN + EXTRA;
+			packlen = MAX(2048, sweepmax) + IP6LEN + ICMP6ECHOLEN + EXTRA;
 		else
-			packlen = datalen + IP6LEN + ICMP6ECHOLEN + EXTRA;
+			packlen = MAX(datalen, sweepmax) + IP6LEN + ICMP6ECHOLEN + EXTRA;
 	} else {
 		/* suppress timing for node information query */
 		timing = 0;
@@ -805,30 +951,21 @@ main(int argc, char *argv[])
 		packlen = 2048 + IP6LEN + ICMP6ECHOLEN + EXTRA;
 	}
 
-	if (!(packet = (u_char *)malloc((u_int)packlen)))
+	if (!(packet = (u_char *)malloc(packlen)))
 		err(1, "Unable to allocate packet");
 	if (!(options & F_PINGFILLED))
-		for (i = ICMP6ECHOLEN; i < packlen; ++i)
+		for (i = ICMP6ECHOLEN; i < MAX(datalen, sweepmax); ++i)
 			*datap++ = i;
 
 	ident = getpid() & 0xFFFF;
-#ifndef HAVE_ARC4RANDOM
-	gettimeofday(&seed, NULL);
-	srand((unsigned int)(seed.tv_sec ^ seed.tv_usec ^ (long)ident));
-	memset(nonce, 0, sizeof(nonce));
-	for (i = 0; i < sizeof(nonce); i += sizeof(int))
-		*((int *)&nonce[i]) = rand();
-#else
-	memset(nonce, 0, sizeof(nonce));
-	for (i = 0; i < sizeof(nonce); i += sizeof(u_int32_t))
-		*((u_int32_t *)&nonce[i]) = arc4random();
-#endif
+	arc4random_buf(nonce, sizeof(nonce));
 	optval = 1;
 	if (options & F_DONTFRAG)
 		if (setsockopt(s, IPPROTO_IPV6, IPV6_DONTFRAG,
 		    &optval, sizeof(optval)) == -1)
 			err(1, "IPV6_DONTFRAG");
 	hold = 1;
+
 	if (options & F_SO_DEBUG)
 		(void)setsockopt(s, SOL_SOCKET, SO_DEBUG, (char *)&hold,
 		    sizeof(hold));
@@ -959,17 +1096,29 @@ main(int argc, char *argv[])
 	if (tclass != -2)
 		ip6optlen += CMSG_SPACE(sizeof(int));
 
-	if (how_so_traffic_class < 2 && so_traffic_class >= 0) {
-		(void) setsockopt(s, SOL_SOCKET, SO_TRAFFIC_CLASS,
-		    (void *)&so_traffic_class, sizeof (so_traffic_class));
+	if (use_sendmsg == 0) {
+		if (net_service_type != -1)
+			if (setsockopt(s, SOL_SOCKET, SO_NET_SERVICE_TYPE,
+				       (void *)&net_service_type, sizeof (net_service_type)) != 0)
+				warn("setsockopt(SO_NET_SERVICE_TYPE");
+		if (so_traffic_class != -1) {
+			if (setsockopt(s, SOL_SOCKET, SO_TRAFFIC_CLASS,
+			    (void *)&so_traffic_class, sizeof (so_traffic_class)) != 0)
+				warn("setsockopt(SO_TRAFFIC_CLASS");
+			
+		}
+	} else {
+		if (net_service_type != -1)
+			ip6optlen += CMSG_SPACE(sizeof(int));
+		if (so_traffic_class != -1)
+			ip6optlen += CMSG_SPACE(sizeof(int));
 	}
-	if (how_so_traffic_class > 0) {
+	if (use_recvmsg > 0) {
 		int on = 1;
-		(void) setsockopt(s, SOL_SOCKET, SO_RECV_TRAFFIC_CLASS,
-		    (void *)&on, sizeof (on));
+		if (setsockopt(s, SOL_SOCKET, SO_RECV_TRAFFIC_CLASS,
+		    (void *)&on, sizeof (on)) != 0)
+			warn("setsockopt(SO_RECV_TRAFFIC_CLASS");
 	}
-	if (how_so_traffic_class > 1)
-		ip6optlen += CMSG_SPACE(sizeof(int));
 
 	/* set IP6 packet options */
 	if (ip6optlen) {
@@ -1082,13 +1231,21 @@ main(int argc, char *argv[])
 
 		scmsgp = CMSG_NXTHDR(&smsghdr, scmsgp);
 	}
-	if (how_so_traffic_class > 1 && so_traffic_class >= 0) {
-		scmsgp->cmsg_len = CMSG_LEN(sizeof(int));
-		scmsgp->cmsg_level = SOL_SOCKET;
-		scmsgp->cmsg_type = SO_TRAFFIC_CLASS;
-		*(int *)(CMSG_DATA(scmsgp)) = so_traffic_class;
+	if (use_sendmsg != 0) {
+		if (so_traffic_class != -1) {
+			scmsgp->cmsg_len = CMSG_LEN(sizeof(int));
+			scmsgp->cmsg_level = SOL_SOCKET;
+			scmsgp->cmsg_type = SO_TRAFFIC_CLASS;
+			*(int *)(CMSG_DATA(scmsgp)) = so_traffic_class;
 
-		scmsgp = CMSG_NXTHDR(&smsghdr, scmsgp);
+			scmsgp = CMSG_NXTHDR(&smsghdr, scmsgp);
+		}
+		if (net_service_type != -1) {
+			scmsgp->cmsg_len = CMSG_LEN(sizeof(int));
+			scmsgp->cmsg_level = SOL_SOCKET;
+			scmsgp->cmsg_type = SO_NET_SERVICE_TYPE;
+			*(int *)(CMSG_DATA(scmsgp)) = net_service_type;
+		}
 	}
 	if (!(options & F_SRCADDR)) {
 		/*
@@ -1156,7 +1313,7 @@ main(int argc, char *argv[])
 
 #if defined(SO_SNDBUF) && defined(SO_RCVBUF)
 	if (sockbufsize) {
-		if (datalen > sockbufsize)
+		if (MAX(datalen, sweepmax) > sockbufsize)
 			warnx("you need -b to increase socket buffer size");
 		if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sockbufsize,
 		    sizeof(sockbufsize)) < 0)
@@ -1166,7 +1323,7 @@ main(int argc, char *argv[])
 			err(1, "setsockopt(SO_RCVBUF)");
 	}
 	else {
-		if (datalen > 8 * 1024)	/*XXX*/
+		if (MAX(datalen, sweepmax) > 8 * 1024)	/*XXX*/
 			warnx("you need -b to increase socket buffer size");
 		/*
 		 * When pinging the broadcast address, you can get a lot of
@@ -1203,62 +1360,73 @@ main(int argc, char *argv[])
 		    optval, sizeof(optval)); /* XXX err? */
 #endif
 
-	printf("PING6(%lu=40+8+%lu bytes) ", (unsigned long)(40 + pingerlen()),
-	    (unsigned long)(pingerlen() - 8));
+	if (sweepmax)
+		printf("PING6(40+8+[%lu...%lu] bytes) ",
+		       (unsigned long)(sweepmin),
+		       (unsigned long)(sweepmax));
+	else
+		printf("PING6(%lu=40+8+%lu bytes) ", (unsigned long)(40 + pingerlen()),
+	    		(unsigned long)(pingerlen() - 8));
 	printf("%s --> ", pr_addr((struct sockaddr *)&src, sizeof(src)));
 	printf("%s\n", pr_addr((struct sockaddr *)&dst, sizeof(dst)));
 
-	while (preload--)		/* Fire off them quickies. */
-		(void)pinger();
-
-	(void)signal(SIGINT, onsignal);
-#ifdef SIGINFO
-	(void)signal(SIGINFO, onsignal);
-#endif
-
-	if ((options & F_FLOOD) == 0) {
-		(void)signal(SIGALRM, onsignal);
-		itimer.it_interval = interval;
-		itimer.it_value = interval;
-		(void)setitimer(ITIMER_REAL, &itimer, NULL);
-		if (ntransmitted == 0)
-			retransmit();
+	if (preload == 0)
+		pinger();
+	else {
+		if (npackets != 0 && preload > npackets)
+			preload = npackets;
+		while (preload--)
+			pinger();
 	}
+	gettimeofday(&last, NULL);
 
-#ifndef HAVE_POLL_H
-	fdmasks = howmany(s + 1, NFDBITS) * sizeof(fd_mask);
-	if ((fdmaskp = malloc(fdmasks)) == NULL)
-		err(1, "malloc");
-#endif
-
+	/*
+	 * rdar://25829310
+	 *
+	 * Clear blocked signals inherited from the parent
+	 */
+	sigset_t newset;
+	sigemptyset(&newset);
+	if (sigprocmask(SIG_SETMASK, &newset, NULL) != 0)
+		err(EX_OSERR, "sigprocmask(newset)");
+	
 	seenalrm = seenint = 0;
 #ifdef SIGINFO
 	seeninfo = 0;
 #endif
+	
+	(void)signal(SIGINT, onsignal);
+#ifdef SIGINFO
+	(void)signal(SIGINFO, onsignal);
+#endif
+	if (alarmtimeout > 0) {
+		(void)signal(SIGALRM, onsignal);
+	}
+
+	if (options & F_FLOOD) {
+		intvl.tv_sec = 0;
+		intvl.tv_usec = 10000;
+	} else if ((options & F_INTERVAL) == 0) {
+		intvl.tv_sec = interval / 1000;
+		intvl.tv_usec = interval % 1000 * 1000;
+	}
 
 	/* For control (ancillary) data received from recvmsg() */
 	cm = (struct cmsghdr *)malloc(CONTROLLEN);
 	if (cm == NULL)
 		err(1, "malloc");
 
-	for (;;) {
+	almost_done = 0;
+	while (seenint == 0) {
+		struct timeval now, timeout;
 		struct msghdr m;
 		struct iovec iov[2];
+		fd_set rfds;
+		int n;
 
 		/* signal handling */
-		if (seenalrm) {
-			/* last packet sent, timeout reached? */
-			if (npackets && ntransmitted >= npackets)
-				break;
-			retransmit();
-			seenalrm = 0;
-			continue;
-		}
-		if (seenint) {
+		if (seenint)
 			onint(SIGINT);
-			seenint = 0;
-			continue;
-		}
 #ifdef SIGINFO
 		if (seeninfo) {
 			summary();
@@ -1266,111 +1434,110 @@ main(int argc, char *argv[])
 			continue;
 		}
 #endif
-
-		if (options & F_FLOOD) {
-			(void)pinger();
-#ifdef HAVE_POLL_H
-			timeout = 10;
-#else
-			timeout.tv_sec = 0;
-			timeout.tv_usec = 10000;
-			tv = &timeout;
-#endif
-		} else {
-#ifdef HAVE_POLL_H
-			timeout = INFTIM;
-#else
-			tv = NULL;
-#endif
+		FD_ZERO(&rfds);
+		FD_SET(s, &rfds);
+		gettimeofday(&now, NULL);
+		timeout.tv_sec = last.tv_sec + intvl.tv_sec - now.tv_sec;
+		timeout.tv_usec = last.tv_usec + intvl.tv_usec - now.tv_usec;
+		while (timeout.tv_usec < 0) {
+			timeout.tv_usec += 1000000;
+			timeout.tv_sec--;
+			}
+		while (timeout.tv_usec > 1000000) {
+			timeout.tv_usec -= 1000000;
+			timeout.tv_sec++;
 		}
-#ifdef HAVE_POLL_H
-		fdmaskp[0].fd = s;
-		fdmaskp[0].events = POLLIN;
-		cc = poll(fdmaskp, 1, timeout);
-#else
-		memset(fdmaskp, 0, fdmasks);
-		FD_SET(s, fdmaskp);
-		cc = select(s + 1, fdmaskp, NULL, NULL, tv);
-#endif
-		if (cc < 0) {
-			if (errno != EINTR) {
-#ifdef HAVE_POLL_H
-				warn("poll");
-#else
-				warn("select");
-#endif
-				sleep(1);
+		if (timeout.tv_sec < 0)
+			timeout.tv_sec = timeout.tv_usec = 0;
+
+		n = select(s + 1, &rfds, NULL, NULL, &timeout);
+		if (n < 0)
+			continue;	/* EINTR */
+		if (n == 1) {
+			m.msg_name = (caddr_t)&from;
+			m.msg_namelen = sizeof(from);
+			memset(&iov, 0, sizeof(iov));
+			iov[0].iov_base = (caddr_t)packet;
+			iov[0].iov_len = packlen;
+			m.msg_iov = iov;
+			m.msg_iovlen = 1;
+			memset(cm, 0, CONTROLLEN);
+			m.msg_control = (void *)cm;
+			m.msg_controllen = CONTROLLEN;
+			m.msg_flags = 0;
+
+			cc = recvmsg(s, &m, 0);
+			if (cc < 0) {
+				if (errno != EINTR) {
+					warn("recvmsg");
+					sleep(1);
+				}
+				continue;
+			} else if (cc == 0) {
+				int mtu;
+
+				/*
+				 * receive control messages only. Process the
+				 * exceptions (currently the only possibility is
+				 * a path MTU notification.)
+				 */
+				if ((mtu = get_pathmtu(&m)) > 0) {
+					if ((options & F_VERBOSE) != 0) {
+						printf("new path MTU (%d) is "
+						       "notified\n", mtu);
+					}
+				}
+				continue;
+			} else {
+				/*
+				 * an ICMPv6 message (probably an echoreply)
+				 * arrived.
+				 */
+				pr_pack(packet, cc, &m);
 			}
-			continue;
-		} else if (cc == 0)
-			continue;
-
-		m.msg_name = (caddr_t)&from;
-		m.msg_namelen = sizeof(from);
-		memset(&iov, 0, sizeof(iov));
-		iov[0].iov_base = (caddr_t)packet;
-		iov[0].iov_len = packlen;
-		m.msg_iov = iov;
-		m.msg_iovlen = 1;
-		memset(cm, 0, CONTROLLEN);
-		m.msg_control = (void *)cm;
-		m.msg_controllen = CONTROLLEN;
-
-		cc = recvmsg(s, &m, 0);
-		if (cc < 0) {
-			if (errno != EINTR) {
-				warn("recvmsg");
-				sleep(1);
-			}
-			continue;
-		} else if (cc == 0) {
-			int mtu;
-
-			/*
-			 * receive control messages only. Process the
-			 * exceptions (currently the only possibility is
-			 * a path MTU notification.)
-			 */
-			if ((mtu = get_pathmtu(&m)) > 0) {
-				if ((options & F_VERBOSE) != 0) {
-					printf("new path MTU (%d) is "
-					    "notified\n", mtu);
+			if (((options & F_ONCE) != 0 && nreceived > 0) ||
+			    (npackets > 0 && nreceived >= npackets) ||
+			     (sweepmax && datalen > sweepmax))
+				break;
+		}
+		if (n == 0 || (options & F_FLOOD)) {
+			if (npackets == 0 || ntransmitted < npackets)
+				pinger();
+			else {
+				if (almost_done)
+					break;
+				almost_done = 1;
+				/*
+				 * If we're not transmitting any more packets,
+				 * change the timer to wait two round-trip times
+				 * if we've received any packets or (waittime)
+				 * milliseconds if we haven't.
+				 */
+				intvl.tv_usec = 0;
+				if (nreceived) {
+					intvl.tv_sec = 2 * tmax / 1000;
+					if (intvl.tv_sec == 0)
+						intvl.tv_sec = 1;
+				} else {
+					intvl.tv_sec = waittime / 1000;
+					intvl.tv_usec = waittime % 1000 * 1000;
 				}
 			}
-			continue;
-		} else {
-			/*
-			 * an ICMPv6 message (probably an echoreply) arrived.
-			 */
-			pr_pack(packet, cc, &m);
-		}
-		if (((options & F_ONCE) != 0 && nreceived > 0) ||
-		    (npackets > 0 && nreceived >= npackets))
-			break;
-		if (ntransmitted - nreceived - 1 > nmissedmax) {
-			nmissedmax = ntransmitted - nreceived - 1;
-			if (options & F_MISSED)
-				(void)write(STDOUT_FILENO, &BBELL, 1);
+			gettimeofday(&last, NULL);
+			if (ntransmitted - nreceived - 1 > nmissedmax) {
+				nmissedmax = ntransmitted - nreceived - 1;
+				if (options & F_MISSED)
+					(void)write(STDOUT_FILENO, &BBELL, 1);
+			}
 		}
 	}
+	sigemptyset(&newset);
+	if (sigprocmask(SIG_SETMASK, &newset, NULL) != 0)
+		err(EX_OSERR, "sigprocmask(newset)");
 	summary();
-
-	if (res != NULL)
-		freeaddrinfo(res);
 
         if (packet != NULL)
                 free(packet);
-
-	if (cm != NULL)
-		free(cm);
-
-	if (scmsg != NULL)
-		free(scmsg);
-
-#ifndef HAVE_POLL_H
-        if (fdmaskp != NULL)
-                free(fdmaskp);
-#endif
 
 	exit(nreceived == 0 ? 2 : 0);
 }
@@ -1378,12 +1545,11 @@ main(int argc, char *argv[])
 void
 onsignal(int sig)
 {
-
+	fflush(stdout);
+	
 	switch (sig) {
-	case SIGALRM:
-		seenalrm++;
-		break;
 	case SIGINT:
+	case SIGALRM:
 		seenint++;
 		break;
 #ifdef SIGINFO
@@ -1392,38 +1558,6 @@ onsignal(int sig)
 		break;
 #endif
 	}
-}
-
-/*
- * retransmit --
- *	This routine transmits another ping6.
- */
-void
-retransmit(void)
-{
-	struct itimerval itimer;
-
-	if (pinger() == 0)
-		return;
-
-	/*
-	 * If we're not transmitting any more packets, change the timer
-	 * to wait two round-trip times if we've received any packets or
-	 * ten seconds if we haven't.
-	 */
-#define	MAXWAIT		10
-	if (nreceived) {
-		itimer.it_value.tv_sec =  2 * tmax / 1000;
-		if (itimer.it_value.tv_sec == 0)
-			itimer.it_value.tv_sec = 1;
-	} else
-		itimer.it_value.tv_sec = MAXWAIT;
-	itimer.it_interval.tv_sec = 0;
-	itimer.it_interval.tv_usec = 0;
-	itimer.it_value.tv_usec = 0;
-
-	(void)signal(SIGALRM, onsignal);
-	(void)setitimer(ITIMER_REAL, &itimer, NULL);
 }
 
 /*
@@ -1457,13 +1591,19 @@ int
 pinger(void)
 {
 	struct icmp6_hdr *icp;
-	struct iovec iov[2];
 	int i, cc;
 	struct icmp6_nodeinfo *nip;
 	int seq;
 
 	if (npackets && ntransmitted >= npackets)
 		return(-1);	/* no more transmission */
+
+	if (sweepmax && sntransmitted == snpackets) {
+		datalen += sweepincr;
+		if (datalen > sweepmax)
+			return(-1);	/* no more transmission */
+		sntransmitted = 0;
+	}
 
 	icp = (struct icmp6_hdr *)outpack;
 	nip = (struct icmp6_nodeinfo *)outpack;
@@ -1546,12 +1686,17 @@ pinger(void)
 		errx(1, "internal error; length mismatch");
 #endif
 
+	if ((options & F_CONNECT)) {
+		smsghdr.msg_name = NULL;
+		smsghdr.msg_namelen = 0;
+	} else {
 	smsghdr.msg_name = (caddr_t)&dst;
 	smsghdr.msg_namelen = sizeof(dst);
-	memset(&iov, 0, sizeof(iov));
-	iov[0].iov_base = (caddr_t)outpack;
-	iov[0].iov_len = cc;
-	smsghdr.msg_iov = iov;
+	}
+	memset(&smsgiov, 0, sizeof(smsgiov));
+	smsgiov[0].iov_base = (caddr_t)outpack;
+	smsgiov[0].iov_len = cc;
+	smsghdr.msg_iov = smsgiov;
 	smsghdr.msg_iovlen = 1;
 
 	i = sendmsg(s, &smsghdr, 0);
@@ -1562,6 +1707,7 @@ pinger(void)
 		(void)printf("ping6: wrote %s %d chars, ret=%d\n",
 		    hostname, cc, i);
 	}
+	sntransmitted++;
 	if (!(options & F_QUIET) && options & F_FLOOD)
 		(void)write(STDOUT_FILENO, &DOT, 1);
 
@@ -1593,7 +1739,7 @@ dnsdecode(const u_char **sp, const u_char *ep, const u_char *base, char *buf,
     size_t bufsiz)
 	/*base for compressed name*/
 {
-	int i;
+	int i = 0;
 	const u_char *cp;
 	char cresult[NS_MAXDNAME + 1];
 	const u_char *comp;
@@ -1715,7 +1861,7 @@ pr_pack(u_char *buf, int cc, struct msghdr *mhdr)
 		return;
 	}
 
-	if (how_so_traffic_class > 0)
+	if (use_recvmsg > 0)
 		sotc = get_so_traffic_class(mhdr);
 
 	if (icp->icmp6_type == ICMP6_ECHO_REPLY && myechoreply(icp)) {
@@ -1748,11 +1894,18 @@ pr_pack(u_char *buf, int cc, struct msghdr *mhdr)
 		if (options & F_QUIET)
 			return;
 
+		if (options & F_WAITTIME && triptime > waittime) {
+			++nrcvtimeout;
+			return;
+		}
+
 		if (options & F_FLOOD)
 			(void)write(STDOUT_FILENO, &BSPACE, 1);
 		else {
 			if (options & F_AUDIBLE)
 				(void)write(STDOUT_FILENO, &BBELL, 1);
+			if (options & F_PRTIME)
+				pr_currenttime();
 			(void)printf("%d bytes from %s, icmp_seq=%u", cc,
 			    pr_addr(from, fromlen), seq);
 			(void)printf(" hlim=%d", hoplim);
@@ -1783,9 +1936,7 @@ pr_pack(u_char *buf, int cc, struct msghdr *mhdr)
 			dp = outpack + ICMP6ECHOLEN + ICMP6ECHOTMLEN;
 			for (i = 8; cp < end; ++i, ++cp, ++dp) {
 				if (*cp != *dp) {
-					(void)printf("\nwrong data byte #%d "
-					    "should be 0x%x but was 0x%x",
-					    i, *dp, *cp);
+					(void)printf("\nwrong data byte #%d should be 0x%x but was 0x%x", i, *dp, *cp);
 					break;
 				}
 			}
@@ -1805,6 +1956,8 @@ pr_pack(u_char *buf, int cc, struct msghdr *mhdr)
 		if (options & F_QUIET)
 			return;
 
+		if (options & F_PRTIME)
+			pr_currenttime();
 		(void)printf("%d bytes from %s: ", cc, pr_addr(from, fromlen));
 
 		switch (ntohs(ni->ni_code)) {
@@ -1891,8 +2044,7 @@ pr_pack(u_char *buf, int cc, struct msghdr *mhdr)
 					putchar(')');
 					goto fqdnend;
 				}
-				ttl = (int32_t)ntohl(*(u_int32_t *)
-				    &buf[off+ICMP6ECHOLEN+8]);
+				ttl = (int32_t)ntohl(*(u_long *)&buf[off+ICMP6ECHOLEN+8]);
 				if (comma)
 					printf(",");
 				if (!(ni->ni_flags & NI_FQDN_FLAG_VALIDTTL)) {
@@ -1941,6 +2093,8 @@ pr_pack(u_char *buf, int cc, struct msghdr *mhdr)
 		/* We've got something other than an ECHOREPLY */
 		if (!(options & F_VERBOSE))
 			return;
+		if (options & F_PRTIME)
+			pr_currenttime();
 		(void)printf("%d bytes from %s: ", cc, pr_addr(from, fromlen));
 		pr_icmph(icp, end);
 	}
@@ -1998,7 +2152,7 @@ pr_ip6opt(void *extbuf, size_t bufsize)
 	struct ip6_hbh *ext;
 	int currentlen;
 	u_int8_t type;
-	socklen_t extlen, len, origextlen;
+	socklen_t extlen, len;
 	void *databuf;
 	size_t offset;
 	u_int16_t value2;
@@ -2014,7 +2168,6 @@ pr_ip6opt(void *extbuf, size_t bufsize)
 	 *     subtract the size of a cmsg structure from the buffer size.
 	 */
 	if (bufsize < (extlen  + CMSG_SPACE(0))) {
-		origextlen = extlen;
 		extlen = bufsize - CMSG_SPACE(0);
 		warnx("options truncated, showing only %u (total=%u)",
 		    (unsigned int)(extlen / 8 - 1),
@@ -2034,14 +2187,14 @@ pr_ip6opt(void *extbuf, size_t bufsize)
 		 */
 		case IP6OPT_JUMBO:
 			offset = 0;
-			offset = inet6_opt_get_val(databuf, offset,
+			(void) inet6_opt_get_val(databuf, offset,
 			    &value4, sizeof(value4));
 			printf("    Jumbo Payload Opt: Length %u\n",
 			    (u_int32_t)ntohl(value4));
 			break;
 		case IP6OPT_ROUTER_ALERT:
 			offset = 0;
-			offset = inet6_opt_get_val(databuf, offset,
+			(void)inet6_opt_get_val(databuf, offset,
 						   &value2, sizeof(value2));
 			printf("    Router Alert Opt: Type %u\n",
 			    ntohs(value2));
@@ -2187,7 +2340,7 @@ pr_suptypes(struct icmp6_nodeinfo *ni, size_t nilen)
 	struct cbit {
 		u_int16_t words;	/*32bit count*/
 		u_int16_t skip;
-	} cbit;
+	} cbit = { 0, 0 };
 #define MAXQTYPES	(1 << 16)
 	size_t off;
 	int b;
@@ -2463,30 +2616,12 @@ tvsub(struct timeval *out, struct timeval *in)
 void
 onint(int notused __unused)
 {
-	summary();
-
-	if (res != NULL)
-		freeaddrinfo(res);
-
-        if (packet != NULL)
-                free(packet);
-
-	if (cm != NULL)
-		free(cm);
-
-	if (scmsg != NULL)
-		free(scmsg);
-
-#ifndef HAVE_POLL_H
-        if (fdmaskp != NULL)
-                free(fdmaskp);
-#endif
-
-	(void)signal(SIGINT, SIG_DFL);
-	(void)kill(getpid(), SIGINT);
-
-	/* NOTREACHED */
-	exit(1);
+	/*
+	 * When doing reverse DNS lookups, the seenint flag might not
+	 * be noticed for a while.  Just exit if we get a second SIGINT.
+	 */
+	if ((options & F_HOSTNAME) && seenint != 0)
+		_exit(nreceived ? 0 : 2);
 }
 
 /*
@@ -2509,6 +2644,8 @@ summary(void)
 			    ((((double)ntransmitted - nreceived) * 100.0) /
 			    ntransmitted));
 	}
+	if (nrcvtimeout)
+		printf(", %ld packets out of wait time", nrcvtimeout);
 	(void)putchar('\n');
 	if (nreceived && timing) {
 		/* Only display average to microseconds */
@@ -2534,7 +2671,6 @@ static const char *niqcode[] = {
 static const char *nircode[] = {
 	"Success", "Refused", "Unknown",
 };
-
 
 /*
  * pr_icmph --
@@ -2952,7 +3088,7 @@ setpolicy(int so __unused, char *policy)
 #endif
 
 char *
-nigroup(char *name)
+nigroup(char *name, int nig_oldmcprefix)
 {
 	char *p;
 	char *q;
@@ -2962,6 +3098,7 @@ nigroup(char *name)
 	size_t l;
 	char hbuf[NI_MAXHOST];
 	struct in6_addr in6;
+	int valid;
 
 	p = strchr(name, '.');
 	if (!p)
@@ -2969,7 +3106,7 @@ nigroup(char *name)
 	l = p - name;
 	if (l > 63 || l > sizeof(hbuf) - 1)
 		return NULL;	/*label too long*/
-	strncpy(hbuf, name, l);
+	strlcpy(hbuf, name, l);
 	hbuf[(int)l] = '\0';
 
 	for (q = name; *q; q++) {
@@ -2977,7 +3114,7 @@ nigroup(char *name)
 			*q = tolower(*(unsigned char *)q);
 	}
 
-	/* generate 8 bytes of pseudo-random value. */
+	/* generate 16 bytes of pseudo-random value. */
 	memset(&ctxt, 0, sizeof(ctxt));
 	MD5Init(&ctxt);
 	c = l & 0xff;
@@ -2985,9 +3122,23 @@ nigroup(char *name)
 	MD5Update(&ctxt, (unsigned char *)name, l);
 	MD5Final(digest, &ctxt);
 
-	if (inet_pton(AF_INET6, "ff02::2:0000:0000", &in6) != 1)
+	if (nig_oldmcprefix) {
+		/* draft-ietf-ipngwg-icmp-name-lookup */
+		valid = inet_pton(AF_INET6, "ff02::2:0000:0000", &in6);
+	} else {
+		/* RFC 4620 */
+		valid = inet_pton(AF_INET6, "ff02::2:ff00:0000", &in6);
+	}
+	if (valid != 1)
 		return NULL;	/*XXX*/
+	
+	if (nig_oldmcprefix) {
+		/* draft-ietf-ipngwg-icmp-name-lookup */
 	bcopy(digest, &in6.s6_addr[12], 4);
+	} else {
+		/* RFC 4620 */
+		bcopy(digest, &in6.s6_addr[13], 3);
+	}
 
 	if (inet_ntop(AF_INET6, &in6, hbuf, sizeof(hbuf)) == NULL)
 		return NULL;
@@ -2995,14 +3146,16 @@ nigroup(char *name)
 	return strdup(hbuf);
 }
 
-uint32_t
-str2svc(const char *str)
+int
+str2sotc(const char *str, bool *valid)
 {
-	uint32_t svc;
+	int sotc = -1;
 	char *endptr;
 	
+	*valid = true;
+	
 	if (str == NULL || *str == '\0')
-		svc = UINT32_MAX;
+		*valid = false;
 	else if (strcasecmp(str, "BK_SYS") == 0)
 		return SO_TC_BK_SYS;
 	else if (strcasecmp(str, "BK") == 0)
@@ -3024,11 +3177,130 @@ str2svc(const char *str)
 	else if (strcasecmp(str, "CTL") == 0)
 		return SO_TC_CTL;
 	else {
-		svc = strtoul(str, &endptr, 0);
+		sotc = (int)strtol(str, &endptr, 0);
 		if (*endptr != '\0')
-			svc = UINT32_MAX;
+			*valid = false;
+	}
+	return (sotc);
+}
+
+int
+str2netservicetype(const char *str, bool *valid)
+{
+	int svc = -1;
+	char *endptr;
+	
+	*valid = true;
+	
+	if (str == NULL || *str == '\0')
+		*valid = false;
+	else if (strcasecmp(str, "BK") == 0)
+		return NET_SERVICE_TYPE_BK;
+	else if (strcasecmp(str, "BE") == 0)
+		return NET_SERVICE_TYPE_BE;
+	else if (strcasecmp(str, "VI") == 0)
+		return NET_SERVICE_TYPE_VI;
+	else if (strcasecmp(str, "SIG") == 0)
+		return NET_SERVICE_TYPE_SIG;
+	else if (strcasecmp(str, "VO") == 0)
+		return NET_SERVICE_TYPE_VO;
+	else if (strcasecmp(str, "RV") == 0)
+		return NET_SERVICE_TYPE_RV;
+	else if (strcasecmp(str, "AV") == 0)
+		return NET_SERVICE_TYPE_AV;
+	else if (strcasecmp(str, "OAM") == 0)
+		return NET_SERVICE_TYPE_OAM;
+	else if (strcasecmp(str, "RD") == 0)
+		return NET_SERVICE_TYPE_RD;
+	else {
+		svc = (int)strtol(str, &endptr, 0);
+		if (*endptr != '\0')
+			*valid = false;
 	}
 	return (svc);
+}
+
+u_int8_t
+str2tclass(const char *str, bool *valid)
+{
+	u_int8_t dscp = -1;
+	char *endptr;
+	
+	*valid = true;
+	
+	if (str == NULL || *str == '\0')
+		*valid = false;
+	else if (strcasecmp(str, "DF") == 0)
+		dscp = _DSCP_DF;
+	else if (strcasecmp(str, "EF") == 0)
+		dscp = _DSCP_EF;
+	else if (strcasecmp(str, "VA") == 0)
+		dscp = _DSCP_VA;
+	
+	else if (strcasecmp(str, "CS0") == 0)
+		dscp = _DSCP_CS0;
+	else if (strcasecmp(str, "CS1") == 0)
+		dscp = _DSCP_CS1;
+	else if (strcasecmp(str, "CS2") == 0)
+		dscp = _DSCP_CS2;
+	else if (strcasecmp(str, "CS3") == 0)
+		dscp = _DSCP_CS3;
+	else if (strcasecmp(str, "CS4") == 0)
+		dscp = _DSCP_CS4;
+	else if (strcasecmp(str, "CS5") == 0)
+		dscp = _DSCP_CS5;
+	else if (strcasecmp(str, "CS6") == 0)
+		dscp = _DSCP_CS6;
+	else if (strcasecmp(str, "CS7") == 0)
+		dscp = _DSCP_CS7;
+	
+	else if (strcasecmp(str, "AF11") == 0)
+		dscp = _DSCP_AF11;
+	else if (strcasecmp(str, "AF12") == 0)
+		dscp = _DSCP_AF12;
+	else if (strcasecmp(str, "AF13") == 0)
+		dscp = _DSCP_AF13;
+	else if (strcasecmp(str, "AF21") == 0)
+		dscp = _DSCP_AF21;
+	else if (strcasecmp(str, "AF22") == 0)
+		dscp = _DSCP_AF22;
+	else if (strcasecmp(str, "AF23") == 0)
+		dscp = _DSCP_AF23;
+	else if (strcasecmp(str, "AF31") == 0)
+		dscp = _DSCP_AF31;
+	else if (strcasecmp(str, "AF32") == 0)
+		dscp = _DSCP_AF32;
+	else if (strcasecmp(str, "AF33") == 0)
+		dscp = _DSCP_AF33;
+	else if (strcasecmp(str, "AF41") == 0)
+		dscp = _DSCP_AF41;
+	else if (strcasecmp(str, "AF42") == 0)
+		dscp = _DSCP_AF42;
+	else if (strcasecmp(str, "AF43") == 0)
+		dscp = _DSCP_AF43;
+	
+	else {
+		unsigned long val = strtoul(str, &endptr, 0);
+		if (*endptr != '\0' || val > 255)
+			*valid = false;
+		else
+			return ((u_int8_t)val);
+	}
+	/* DSCP occupies the 6 upper bits of the traffic class field */
+	return (dscp << 2);
+}
+
+void
+pr_currenttime(void)
+{
+	int s;
+	struct timeval tv;
+	
+	gettimeofday(&tv, NULL);
+	
+	s = (tv.tv_sec + thiszone) % 86400;
+	printf("%02d:%02d:%02d.%06u ", s / 3600, (s % 3600) / 60, s % 60,
+	       (u_int32_t)tv.tv_usec);
 }
 
 void
@@ -3048,13 +3320,21 @@ usage(void)
 	    "m"
 #endif
 	    "nNoqrRtvwW] "
-	    "[-a addrtype] [-b bufsiz] [-B boundif] [-c count]\n"
+	    "[-a addrtype] [-b bufsiz] [-c count]\n"
 	    "             [-g gateway] [-h hoplimit] [-I interface] [-i wait] [-l preload]"
 #if defined(IPSEC) && defined(IPSEC_POLICY_IPSEC)
 	    " [-P policy]"
 #endif
 	    "\n"
 	    "             [-p pattern] [-S sourceaddr] [-s packetsize] [-z tclass] "
+	    "[-k traffic_class] [-K net_service_type] "
 	    "[hops ...] host\n");
+	(void)fprintf(stderr, "Apple specific options (to be specified before hops or host like all options)\n");
+	(void)fprintf(stderr, "            -b boundif           # bind the socket to the interface\n");
+	(void)fprintf(stderr, "            -k traffic_class     # set traffic class socket option\n");
+	(void)fprintf(stderr, "            -K net_service_type  # set traffic class socket options\n");
+	(void)fprintf(stderr, "            -apple-connect       # call connect(2) in the socket\n");
+	(void)fprintf(stderr, "            -apple-time          # display current time\n");
+	(void)fprintf(stderr, "            -apple-progress      # show progress for debugging\n");
 	exit(1);
 }

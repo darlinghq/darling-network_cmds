@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009-2014 Apple Inc. All rights reserved.
+ * Copyright (c) 2009-2017 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -83,7 +83,7 @@
 
 #define ND6BITS "\020\001PERFORMNUD\002ACCEPT_RTADV\003PREFER_SOURCE" \
 	"\004IFDISABLED\005DONT_SET_IFROUTE\006PROXY_PREFIXES" \
-	"\007IGNORE_NA\010INSECURE"
+	"\007IGNORE_NA\010INSECURE\011REPLICATED\012DAD"
 
 static	struct in6_ifreq in6_ridreq;
 static	struct in6_aliasreq in6_addreq = 
@@ -119,7 +119,7 @@ setnd6flags(const char *dummyaddr __unused, int d, int s,
 	int error;
 
 	memset(&nd, 0, sizeof(nd));
-	strncpy(nd.ifname, ifr.ifr_name, sizeof(nd.ifname));
+	strlcpy(nd.ifname, ifr.ifr_name, sizeof(nd.ifname));
 	error = ioctl(s, SIOCGIFINFO_IN6, &nd);
 	if (error) {
 		warn("ioctl(SIOCGIFINFO_IN6)");
@@ -247,7 +247,7 @@ in6_status(int s __unused, const struct ifaddrs *ifa)
 	if (sin == NULL)
 		return;
 
-	strncpy(ifr6.ifr_name, ifr.ifr_name, sizeof(ifr.ifr_name));
+	strlcpy(ifr6.ifr_name, ifr.ifr_name, sizeof(ifr.ifr_name));
 	if ((s6 = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
 		warn("socket(AF_INET6,SOCK_DGRAM)");
 		return;
@@ -345,6 +345,8 @@ in6_status(int s __unused, const struct ifaddrs *ifa)
 		printf("dynamic ");
 	if ((flags6 & IN6_IFF_SECURED) != 0)
 		printf("secured ");
+	if ((flags6 & IN6_IFF_CLAT46) != 0)
+		printf("clat46 ");
 
         if (scopeid)
 		printf("scopeid 0x%x ", scopeid);
@@ -508,7 +510,7 @@ in6_status_tunnel(int s)
 	const struct sockaddr *sa = (const struct sockaddr *) &in6_ifr.ifr_addr;
 
 	memset(&in6_ifr, 0, sizeof(in6_ifr));
-	strncpy(in6_ifr.ifr_name, name, IFNAMSIZ);
+	strlcpy(in6_ifr.ifr_name, name, sizeof(in6_ifr.ifr_name));
 
 	if (ioctl(s, SIOCGIFPSRCADDR_IN6, (caddr_t)&in6_ifr) < 0)
 		return;
@@ -539,7 +541,7 @@ nd6_status(int s)
 	int error;
 
 	memset(&nd, 0, sizeof(nd));
-	strncpy(nd.ifname, ifr.ifr_name, sizeof(nd.ifname));
+	strlcpy(nd.ifname, ifr.ifr_name, sizeof(nd.ifname));
 	if ((s6 = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
 		if (errno != EPROTONOSUPPORT)
 			warn("socket(AF_INET6, SOCK_DGRAM)");
@@ -565,7 +567,7 @@ in6_set_tunnel(int s, struct addrinfo *srcres, struct addrinfo *dstres)
 	struct in6_aliasreq in6_addreq; 
 
 	memset(&in6_addreq, 0, sizeof(in6_addreq));
-	strncpy(in6_addreq.ifra_name, name, IFNAMSIZ);
+	strlcpy(in6_addreq.ifra_name, name, sizeof(in6_addreq.ifra_name));
 	memcpy(&in6_addreq.ifra_addr, srcres->ai_addr, srcres->ai_addr->sa_len);
 	memcpy(&in6_addreq.ifra_dstaddr, dstres->ai_addr,
 	    dstres->ai_addr->sa_len);
@@ -580,7 +582,7 @@ in6_set_router(int s, int enable)
 	struct ifreq ifr;
 
 	bzero(&ifr, sizeof (ifr));
-	strncpy(ifr.ifr_name, name, IFNAMSIZ);
+	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 	ifr.ifr_intval = enable;
 
 	if (ioctl(s, SIOCSETROUTERMODE_IN6, &ifr) < 0)
@@ -607,8 +609,8 @@ static struct cmd inet6_cmds[] = {
 	DEF_CMD("-nud",		-ND6_IFF_PERFORMNUD,	setnd6flags),
 	DEF_CMD("ifdisabled",   ND6_IFF_IFDISABLED,	setnd6flags),
 	DEF_CMD("-ifdisabled",  -ND6_IFF_IFDISABLED,	setnd6flags),
-	DEF_CMD("ignore_na",	ND6_IFF_IGNORE_NA,	setnd6flags),
-	DEF_CMD("-ignore_na",	-ND6_IFF_IGNORE_NA,	setnd6flags),
+	DEF_CMD("replicated",	ND6_IFF_REPLICATED,	setnd6flags),
+	DEF_CMD("-replicated",	-ND6_IFF_REPLICATED,	setnd6flags),
 	DEF_CMD("proxy_prefixes", ND6_IFF_PROXY_PREFIXES,	setnd6flags),
 	DEF_CMD("-proxy_prefixes", -ND6_IFF_PROXY_PREFIXES,	setnd6flags),
 	DEF_CMD("insecure",	ND6_IFF_INSECURE,	setnd6flags),
@@ -618,6 +620,8 @@ static struct cmd inet6_cmds[] = {
 	DEF_CMD("eui64",	0,			setip6eui64),
 	DEF_CMD("secured",	IN6_IFF_SECURED,	setip6flags),
 	DEF_CMD("-secured",	-IN6_IFF_SECURED,	setip6flags),
+	DEF_CMD("dad",		ND6_IFF_DAD,		setnd6flags),
+	DEF_CMD("-dad",		-ND6_IFF_DAD,		setnd6flags),
 };
 
 static struct afswtch af_inet6 = {
