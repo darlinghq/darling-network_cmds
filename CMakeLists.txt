@@ -1,6 +1,6 @@
 project(network_cmds)
 
-cmake_minimum_required(VERSION 2.4.0)
+cmake_minimum_required(VERSION 3.10)
 
 # Automatically escape macros
 cmake_policy(SET CMP0005 NEW)
