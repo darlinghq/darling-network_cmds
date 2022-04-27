@@ -1,9 +1,0 @@
-rtadvd_logging.c
-advcap.c
-config.c
-dump.c
-if.c
-rrenum.c
-rtadvd.c
-timer.c
-
