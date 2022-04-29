@@ -40,4 +40,3 @@ add_subdirectory(rtsol.tproj)
 #add_subdirectory(spray.tproj) # missing some RPC stuff in libinfo
 add_subdirectory(traceroute.tproj)
 #add_subdirectory(traceroute6.tproj) # missing libipse; *IS* present on standard macOS install
-add_subdirectory(unbound)
