@@ -20,6 +20,7 @@ add_darling_executable(netstat
 	systm.c
 	tp_astring.c
 	unix.c
+	vsock.c
 )
 
 install(TARGETS netstat DESTINATION libexec/darling/usr/sbin)
