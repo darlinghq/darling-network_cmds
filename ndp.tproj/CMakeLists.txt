@@ -1,5 +1,9 @@
 project(network_cmds-ndp)
 
+add_compile_options(
+	-Wno-error=int-conversion
+)
+
 add_compile_definitions(
 	INET6
 	IPSEC_DEBUG
